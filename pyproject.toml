@@ -1,0 +1,8 @@
+[project]
+name = "reachy-utils"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = [
+    "reachy-mini==1.9.0",
+    "numpy",
+]
