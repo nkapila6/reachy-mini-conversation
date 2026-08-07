@@ -1,8 +1,8 @@
-# Binaries
-reachy-agent
-reachy-mic
-reachy-speak
-reachy-fetch
+# Binaries (not directories)
+/reachy-agent
+/reachy-mic
+/reachy-speak
+/reachy-fetch
 
 # Environment
 .env
