@@ -1,0 +1,25 @@
+# Binaries
+reachy-agent
+reachy-mic
+reachy-speak
+reachy-fetch
+
+# Environment
+.env
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Go
+*.test
+
+# OS
+.DS_Store
+
+# Audio
+*.wav
+
+# SSH
+*.pem
