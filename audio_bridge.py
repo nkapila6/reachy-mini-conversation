@@ -156,7 +156,7 @@ async def run_loops(robot, tts_pipeline, voice_name):
                             indices = np.arange(0, len(pcm), ratio).astype(int)
                             pcm = pcm[indices]
                         # Boost volume.
-                        pcm = np.clip(pcm * 3.0, -1.0, 1.0)
+                        pcm = np.clip(pcm * 5.0, -1.0, 1.0)
                         send({"type": "playing"})
                         robot.media.push_audio_sample(pcm)
                         log.info(

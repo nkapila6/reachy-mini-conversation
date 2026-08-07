@@ -25,6 +25,8 @@ ALL_FILES="$BINARIES $PYFILES"
 echo "=== checking robot prerequisites ==="
 # Ensure the daemon's Python 3.12 exists (uv-managed, can get deleted).
 ssh "$ROBOT" "/venvs/mini_daemon/bin/python --version 2>/dev/null || /opt/uv/uv python install 3.12"
+# Max out the speaker volume.
+ssh "$ROBOT" "amixer -c 0 cset numid=5 60,60 >/dev/null 2>&1 || true"
 echo "done"
 
 echo ""
