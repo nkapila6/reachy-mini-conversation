@@ -162,9 +162,10 @@ func (c *Client) Errors() <-chan error {
 	return c.errCh
 }
 
-// SpeakPCM sends PCM int16 audio to the robot's speaker (for cloud TTS).
+// SpeakPCM sends audio to the robot's speaker (for cloud TTS).
 // sampleRate is the PCM's source sample rate (e.g. 24000 for Kokoro).
-func (c *Client) SpeakPCM(pcm []byte, sampleRate int) error {
+// format is "pcm" or "mp3".
+func (c *Client) SpeakPCM(audio []byte, sampleRate int, format string) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.closed {
@@ -172,8 +173,9 @@ func (c *Client) SpeakPCM(pcm []byte, sampleRate int) error {
 	}
 	msg := map[string]any{
 		"type":        "speak_pcm",
-		"pcm":         base64.StdEncoding.EncodeToString(pcm),
+		"pcm":         base64.StdEncoding.EncodeToString(audio),
 		"sample_rate": sampleRate,
+		"format":      format,
 	}
 	b, _ := json.Marshal(msg)
 	_, err := fmt.Fprintln(c.stdin, string(b))

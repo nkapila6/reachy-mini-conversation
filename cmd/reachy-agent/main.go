@@ -311,24 +311,28 @@ func (a *Agent) speak(text string) {
 	var pcm []byte
 	var err error
 	if a.orTTS != nil {
+		log.Printf("tts: synthesizing via openrouter...")
 		pcm, err = a.orTTS.Synthesize(text)
 		if err != nil {
-			log.Printf("tts: %v", err)
+			log.Printf("tts: openrouter error: %v", err)
 			fmt.Printf("Reachy: %s\n", text)
 			return
 		}
-		if err := a.br.SpeakPCM(pcm, 24000); err != nil {
-			log.Printf("speak: %v", err)
+		log.Printf("tts: got %d bytes of PCM", len(pcm))
+		if err := a.br.SpeakPCM(pcm, 24000, "pcm"); err != nil {
+			log.Printf("speak: bridge error: %v", err)
 		}
 	} else if a.tts != nil {
+		log.Printf("tts: synthesizing via elevenlabs...")
 		pcm, err = a.tts.SynthesizePCM(text, 16000)
 		if err != nil {
-			log.Printf("tts: %v", err)
+			log.Printf("tts: elevenlabs error: %v", err)
 			fmt.Printf("Reachy: %s\n", text)
 			return
 		}
-		if err := a.br.SpeakPCM(pcm, 16000); err != nil {
-			log.Printf("speak: %v", err)
+		log.Printf("tts: got %d bytes of PCM", len(pcm))
+		if err := a.br.SpeakPCM(pcm, 16000, "pcm"); err != nil {
+			log.Printf("speak: bridge error: %v", err)
 		}
 	} else {
 		fmt.Printf("Reachy: %s\n", text)

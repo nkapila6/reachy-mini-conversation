@@ -139,14 +139,15 @@ async def run_loops(robot, tts_pipeline, voice_name):
 
             elif cmd.get("type") == "speak_pcm":
                 # PCM int16 from cloud TTS (OpenRouter or ElevenLabs).
-                # OpenRouter Kokoro returns 24kHz PCM, speaker is 16kHz.
-                pcm_b64 = cmd.get("pcm", "")
+                audio_b64 = cmd.get("pcm", "")
                 sample_rate = cmd.get("sample_rate", 24000)
-                if pcm_b64:
+                if audio_b64:
                     try:
-                        pcm_bytes = base64.b64decode(pcm_b64)
+                        audio_bytes = base64.b64decode(audio_b64)
                         pcm = (
-                            np.frombuffer(pcm_bytes, dtype=np.int16).astype(np.float32)
+                            np.frombuffer(audio_bytes, dtype=np.int16).astype(
+                                np.float32
+                            )
                             / 32768.0
                         )
                         # Resample from source rate to 16kHz if needed.
@@ -154,19 +155,18 @@ async def run_loops(robot, tts_pipeline, voice_name):
                             ratio = float(sample_rate) / 16000.0
                             indices = np.arange(0, len(pcm), ratio).astype(int)
                             pcm = pcm[indices]
-                        # Boost volume -- cloud TTS PCM is often quiet.
+                        # Boost volume.
                         pcm = np.clip(pcm * 3.0, -1.0, 1.0)
-                        # Notify Go that audio is about to play.
                         send({"type": "playing"})
                         robot.media.push_audio_sample(pcm)
                         log.info(
-                            "spoke (cloud pcm): %d bytes -> %d samples (peak=%.3f)",
-                            len(pcm_bytes),
+                            "spoke (pcm): %d bytes -> %d samples (peak=%.3f)",
+                            len(audio_bytes),
                             len(pcm),
                             float(np.max(np.abs(pcm))),
                         )
                     except Exception as e:
-                        log.error("speak_pcm error: %s", e)
+                        log.error("speak error: %s", e)
 
             elif cmd.get("type") == "stop_speaking":
                 try:

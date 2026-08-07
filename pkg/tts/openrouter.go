@@ -14,6 +14,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"time"
 )
 
 // OpenRouterSynthesizer converts text to speech via OpenRouter.
@@ -26,16 +27,9 @@ type OpenRouterSynthesizer struct {
 
 // OpenRouterTTSOpts configures the OpenRouter TTS synthesizer.
 type OpenRouterTTSOpts struct {
-	// APIKey is the OpenRouter API key. If empty, reads OPENROUTER_API_KEY from env.
-	APIKey string
-	// Model is the TTS model (default "hexgrad/kokoro-82m").
-	Model string
-	// Voice is the voice name (default "am_onyx").
-	Voice string
-	// Speed is the speaking rate (default 1.0).
-	Speed float64
-	// ResponseFormat is the audio format (default "mp3", also "pcm", "wav", "opus").
-	ResponseFormat string
+	APIKey string // If empty, reads OPENROUTER_API_KEY from env.
+	Model  string // TTS model (default "hexgrad/kokoro-82m").
+	Voice  string // Voice name (default "am_onyx").
 }
 
 // NewOpenRouterSynthesizer creates a new OpenRouter TTS synthesizer.
@@ -56,40 +50,30 @@ func NewOpenRouterSynthesizer(opts OpenRouterTTSOpts) (*OpenRouterSynthesizer, e
 	if voice == "" {
 		voice = "am_onyx"
 	}
-	speed := opts.Speed
-	if speed == 0 {
-		speed = 1.0
-	}
-	format := opts.ResponseFormat
-	if format == "" {
-		format = "pcm"
-	}
 
 	return &OpenRouterSynthesizer{
 		apiKey: apiKey,
 		model:  model,
 		voice:  voice,
-		client: &http.Client{},
+		client: &http.Client{Timeout: 30 * time.Second},
 	}, nil
 }
 
-// ttsRequest is the JSON body for the OpenRouter TTS endpoint.
+// orTTSRequest matches the OpenRouter TTS API spec.
+// response_format "pcm" returns raw PCM int16 at 24kHz.
 type orTTSRequest struct {
-	Input          string  `json:"input"`
-	Model          string  `json:"model"`
-	Voice          string  `json:"voice"`
-	Speed          float64 `json:"speed"`
-	ResponseFormat string  `json:"response_format"`
+	Input          string `json:"input"`
+	Model          string `json:"model"`
+	Voice          string `json:"voice"`
+	ResponseFormat string `json:"response_format,omitempty"`
 }
 
-// Synthesize converts text to audio bytes.
-// Returns raw audio in the configured format (default PCM).
+// Synthesize converts text to PCM int16 audio bytes at 24kHz.
 func (s *OpenRouterSynthesizer) Synthesize(text string) ([]byte, error) {
 	body := orTTSRequest{
 		Input:          text,
 		Model:          s.model,
 		Voice:          s.voice,
-		Speed:          1.0,
 		ResponseFormat: "pcm",
 	}
 
@@ -117,63 +101,4 @@ func (s *OpenRouterSynthesizer) Synthesize(text string) ([]byte, error) {
 	}
 
 	return io.ReadAll(resp.Body)
-}
-
-// SynthesizeStream converts text to speech and streams audio chunks.
-func (s *OpenRouterSynthesizer) SynthesizeStream(text string) (<-chan []byte, <-chan error) {
-	ch := make(chan []byte, 32)
-	errCh := make(chan error, 1)
-
-	go func() {
-		defer close(ch)
-		defer close(errCh)
-
-		body := orTTSRequest{
-			Input:          text,
-			Model:          s.model,
-			Voice:          s.voice,
-			Speed:          1.0,
-			ResponseFormat: "pcm",
-		}
-
-		b, _ := json.Marshal(body)
-		req, err := http.NewRequest("POST", "https://openrouter.ai/api/v1/audio/speech", bytes.NewReader(b))
-		if err != nil {
-			errCh <- err
-			return
-		}
-		req.Header.Set("Authorization", "Bearer "+s.apiKey)
-		req.Header.Set("Content-Type", "application/json")
-
-		resp, err := s.client.Do(req)
-		if err != nil {
-			errCh <- fmt.Errorf("openrouter tts: %w", err)
-			return
-		}
-		defer resp.Body.Close()
-
-		if resp.StatusCode != 200 {
-			body, _ := io.ReadAll(resp.Body)
-			errCh <- fmt.Errorf("openrouter tts: HTTP %d: %s", resp.StatusCode, string(body))
-			return
-		}
-
-		buf := make([]byte, 4096)
-		for {
-			n, err := resp.Body.Read(buf)
-			if n > 0 {
-				chunk := make([]byte, n)
-				copy(chunk, buf[:n])
-				ch <- chunk
-			}
-			if err != nil {
-				if err != io.EOF {
-					errCh <- err
-				}
-				return
-			}
-		}
-	}()
-
-	return ch, errCh
 }

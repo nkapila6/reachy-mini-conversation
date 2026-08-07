@@ -115,7 +115,11 @@ func main() {
 	}
 
 	// Send to bridge for playback.
-	if err := br.SpeakPCM(pcm, sampleRate); err != nil {
+	format := "pcm"
+	if orTTS != nil {
+		format = "mp3"
+	}
+	if err := br.SpeakPCM(pcm, sampleRate, format); err != nil {
 		log.Fatalf("speak: %v", err)
 	}
 
