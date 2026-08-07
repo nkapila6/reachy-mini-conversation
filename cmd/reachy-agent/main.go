@@ -68,6 +68,9 @@ type Agent struct {
 	ctx    *context.Client
 	br     *bridge.Client
 
+	// Conversation memory: past user + assistant messages.
+	history []map[string]string
+
 	mu       sync.Mutex
 	speaking bool
 }
@@ -403,15 +406,22 @@ func (a *Agent) fetchContext(utterance string) string {
 }
 
 func (a *Agent) generateResponse(utterance, webCtx string) (string, error) {
-	systemPrompt := `You are a friendly, helpful robot assistant named Reachy. You are a physical robot with a moving head and expressive antennas. Keep responses concise and conversational -- 1 to 3 sentences. Be warm and engaging.`
+	systemPrompt := `You are a friendly, helpful robot assistant named Reachy. You are a physical robot with a moving head and expressive antennas. Keep responses concise and conversational, 1 to 3 sentences. Be warm and engaging. You remember past context from the conversation.`
 	if webCtx != "" {
 		systemPrompt += "\n\nHere is some live web context that may help answer the user's question:\n\n" + webCtx
 	}
 
+	// Build messages: system prompt + conversation history + current utterance.
 	messages := []map[string]string{
 		{"role": "system", "content": systemPrompt},
-		{"role": "user", "content": utterance},
 	}
+	// Include last 10 exchanges (20 messages) for context.
+	start := 0
+	if len(a.history) > 20 {
+		start = len(a.history) - 20
+	}
+	messages = append(messages, a.history[start:]...)
+	messages = append(messages, map[string]string{"role": "user", "content": utterance})
 
 	body := map[string]any{
 		"model":       a.llm.Model,
@@ -454,7 +464,15 @@ func (a *Agent) generateResponse(utterance, webCtx string) (string, error) {
 	if len(result.Choices) == 0 {
 		return "", fmt.Errorf("llm returned no choices")
 	}
-	return strings.TrimSpace(result.Choices[0].Message.Content), nil
+	response := strings.TrimSpace(result.Choices[0].Message.Content)
+
+	// Save to conversation history.
+	a.history = append(a.history,
+		map[string]string{"role": "user", "content": utterance},
+		map[string]string{"role": "assistant", "content": response},
+	)
+
+	return response, nil
 }
 
 func splitHost(addr string) (string, string, string) {
