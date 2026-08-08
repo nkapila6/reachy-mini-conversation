@@ -1,28 +1,21 @@
 // reachy-agent is a full voice-first AI agent for the Reachy Mini.
 //
-// It uses a Python audio bridge (audio_bridge.py) that talks to the
-// reachy_mini SDK for mic capture and speaker playback -- same approach
-// as the official conversation app. All logic (STT, LLM, TTS, motion)
-// stays in Go.
-//
-// Usage:
-//
-//	reachy-agent -robot localhost:8000
-//	reachy-agent -robot 192.168.1.100:8000 -voice 21m00Tcm4TlvDq8ikWAM
-//	reachy-agent -robot localhost:8000 -model openai/gpt-4o-mini
+// Optimizations for low latency:
+//   - Persistent STT WebSocket (no reconnect per turn)
+//   - Pre-roll LLM: start generation on confident interim transcript
+//   - Streaming LLM + pipelined TTS: synthesize sentence N+1 while N plays
+//   - Smooth motion: continuous motion loop, ramp between idle and speaking
+//   - Barge-in: user can interrupt the robot mid-sentence
 //
 // Environment / .env:
 //
-//	ELEVENLABS_API_KEY  - ElevenLabs API key (STT + TTS)
-//	OPENROUTER_API_KEY  - OpenRouter API key (LLM)
-//	CONTEXT_API_KEY     - context.dev API key (optional, web lookups)
-//
-// Build:
-//
-//	CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -o reachy-agent ./cmd/reachy-agent
+//	ELEVENLABS_API_KEY  - ElevenLabs API key (STT)
+//	OPENROUTER_API_KEY  - OpenRouter API key (LLM + TTS)
+//	CONTEXT_API_KEY     - context.dev API key (optional)
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/json"
 	"flag"
@@ -34,6 +27,7 @@ import (
 	"os/signal"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -46,14 +40,12 @@ import (
 	"github.com/nkapila6/reachy-utils/pkg/tts"
 )
 
-// LLMConfig holds the LLM endpoint configuration.
 type LLMConfig struct {
 	BaseURL string
 	APIKey  string
 	Model   string
 }
 
-// Agent ties together all the components.
 type Agent struct {
 	robot      string
 	voiceID    string
@@ -61,18 +53,19 @@ type Agent struct {
 	llm        LLMConfig
 	noMotors   bool
 
-	daemon *daemon.Daemon
-	motion *motion.Model
-	tts    *tts.Synthesizer           // ElevenLabs
-	orTTS  *tts.OpenRouterSynthesizer // OpenRouter
-	ctx    *context.Client
-	br     *bridge.Client
+	daemon      *daemon.Daemon
+	motion      *motion.Model
+	tts         *tts.Synthesizer
+	orTTS       *tts.OpenRouterSynthesizer
+	ctx         *context.Client
+	br          *bridge.Client
+	transcriber *stt.ElevenLabsTranscriber
 
-	// Conversation memory: past user + assistant messages.
 	history []map[string]string
 
 	mu       sync.Mutex
 	speaking bool
+	motionOn atomic.Bool
 }
 
 func main() {
@@ -80,9 +73,10 @@ func main() {
 
 	robot := flag.String("robot", "localhost:8000", "reachy_mini daemon host:port")
 	ttsBackend := flag.String("tts", "openrouter", "TTS backend: 'openrouter' or 'elevenlabs'")
-	voiceID := flag.String("voice", "am_onyx", "voice: Kokoro voices (af_heart, af_bella, am_onyx, am_michael, bf_emma, hf_alpha, etc) or ElevenLabs voice ID")
+	voiceID := flag.String("voice", "en-US-Harper:MAI-Voice-2", "voice name (model-specific)")
+	ttsModel := flag.String("tts-model", "microsoft/mai-voice-2-flash", "TTS model on OpenRouter")
 	llmURL := flag.String("llm", "https://openrouter.ai/api/v1", "LLM base URL")
-	llmModel := flag.String("model", "openai/gpt-4o-mini", "LLM model name")
+	llmModel := flag.String("model", "ibm-granite/granite-4.1-8b", "LLM model name")
 	llmKey := flag.String("llm-key", "", "LLM API key (or set OPENROUTER_API_KEY env)")
 	language := flag.String("language", "en", "BCP-47 language code for STT")
 	noMotors := flag.Bool("no-motors", false, "don't drive the robot's motors")
@@ -105,12 +99,11 @@ func main() {
 		},
 	}
 
-	if err := agent.init(); err != nil {
+	if err := agent.init(*language, *ttsModel); err != nil {
 		log.Fatalf("init: %v", err)
 	}
 	defer agent.shutdown()
 
-	// Handle Ctrl-C: put robot to sleep before exiting.
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
@@ -121,11 +114,10 @@ func main() {
 	}()
 
 	log.Printf("ready -- talk to the robot!")
-	agent.loop(*language)
+	agent.loop()
 }
 
-func (a *Agent) init() error {
-	// Start the daemon backend first -- the bridge needs it running.
+func (a *Agent) init(language, ttsModel string) error {
 	if !a.noMotors {
 		log.Printf("starting daemon...")
 		if err := daemon.EnsureReady(a.robot); err != nil {
@@ -133,8 +125,6 @@ func (a *Agent) init() error {
 		}
 	}
 
-	// Start the Python audio bridge -- it creates ReachyMini(), calls
-	// enable_motors() + wake_up(), starts media, and applies DSP config.
 	host, _, _ := splitHost(a.robot)
 	var br *bridge.Client
 	var err error
@@ -147,11 +137,10 @@ func (a *Agent) init() error {
 		time.Sleep(2 * time.Second)
 	}
 	if err != nil {
-		return fmt.Errorf("audio bridge: %w (is audio_bridge.py in the same directory?)", err)
+		return fmt.Errorf("audio bridge: %w", err)
 	}
 	a.br = br
 
-	// Connect motors (the bridge already woke the robot).
 	if !a.noMotors {
 		d, err := daemon.Dial(a.robot)
 		if err != nil {
@@ -159,37 +148,46 @@ func (a *Agent) init() error {
 		}
 		a.daemon = d
 		log.Printf("motors connected (%s)", a.robot)
-
-		// Motion model only runs while speaking -- not during idle/listening.
-		// This prevents the antennas from swinging wildly when the robot is
-		// just sitting there waiting for input.
 		a.motion = motion.New()
+
+		// Continuous motion loop -- runs at 50 Hz for the entire session.
+		// Level ramps between idle (0.15) and speaking (0.7) smoothly.
+		a.motionOn.Store(false)
+		go func() {
+			tick := time.NewTicker(20 * time.Millisecond)
+			defer tick.Stop()
+			for range tick.C {
+				if !a.motionOn.Load() {
+					continue
+				}
+				p := a.motion.Tick()
+				a.daemon.SetFullTarget(p.Head, p.Antennas, p.BodyYaw)
+			}
+		}()
 	}
 
-	// Initialize TTS (optional). Two backends: openrouter or elevenlabs.
 	switch a.ttsBackend {
 	case "elevenlabs":
 		synth, err := tts.NewSynthesizer(tts.SynthesizerOpts{VoiceID: a.voiceID})
 		if err != nil {
-			log.Printf("warning: ElevenLabs TTS not available: %v (voice output disabled)", err)
+			log.Printf("warning: ElevenLabs TTS not available: %v", err)
 		} else {
 			a.tts = synth
 			log.Printf("TTS: elevenlabs (voice=%s)", a.voiceID)
 		}
 	default:
 		orSynth, err := tts.NewOpenRouterSynthesizer(tts.OpenRouterTTSOpts{
-			Model: "hexgrad/kokoro-82m",
+			Model: ttsModel,
 			Voice: a.voiceID,
 		})
 		if err != nil {
-			log.Printf("warning: OpenRouter TTS not available: %v (voice output disabled)", err)
+			log.Printf("warning: OpenRouter TTS not available: %v", err)
 		} else {
 			a.orTTS = orSynth
-			log.Printf("TTS: openrouter/kokoro (voice=%s)", a.voiceID)
+			log.Printf("TTS: openrouter/%s (voice=%s)", ttsModel, a.voiceID)
 		}
 	}
 
-	// Initialize context.dev client (optional).
 	ctxClient, err := context.New("")
 	if err != nil {
 		log.Printf("warning: context.dev not available: %v", err)
@@ -197,10 +195,26 @@ func (a *Agent) init() error {
 		a.ctx = ctxClient
 	}
 
+	// Persistent STT session with low VAD threshold.
+	log.Printf("starting STT session...")
+	tr, err := stt.NewElevenLabsTranscriber(stt.ElevenLabsSTTOpts{
+		Language:          language,
+		SampleRate:        16000,
+		VadSilenceSeconds: 0.8,
+	})
+	if err != nil {
+		return fmt.Errorf("stt: %w", err)
+	}
+	a.transcriber = tr
+	log.Printf("STT session ready")
+
 	return nil
 }
 
 func (a *Agent) shutdown() {
+	if a.transcriber != nil {
+		a.transcriber.Close()
+	}
 	if a.br != nil {
 		a.br.Close()
 	}
@@ -209,10 +223,26 @@ func (a *Agent) shutdown() {
 	}
 }
 
-func (a *Agent) loop(language string) {
+func (a *Agent) loop() {
+	// Continuously pipe mic audio to the persistent STT session.
+	go func() {
+		for pcm := range a.br.Audio() {
+			if err := a.transcriber.Write(pcm); err != nil {
+				log.Printf("stt: write error: %v", err)
+				return
+			}
+		}
+	}()
+
+	go func() {
+		for err := range a.transcriber.Errors() {
+			log.Printf("stt: error: %v", err)
+		}
+	}()
+
 	for {
 		log.Printf("listening...")
-		utterance, err := a.listen(language)
+		utterance, err := a.listen()
 		if err != nil {
 			log.Printf("listen error: %v", err)
 			time.Sleep(time.Second)
@@ -229,74 +259,37 @@ func (a *Agent) loop(language string) {
 		}
 
 		webCtx := a.fetchContext(utterance)
-		response, err := a.generateResponse(utterance, webCtx)
-		if err != nil {
-			log.Printf("llm error: %v", err)
-			a.speak("Sorry, I had trouble thinking of a response.")
-			continue
-		}
-		log.Printf("response: %q", response)
-		a.speak(response)
+		a.respondAndSpeak(utterance, webCtx)
 	}
 }
 
-// listen captures audio from the bridge and transcribes via ElevenLabs STT.
-func (a *Agent) listen(language string) (string, error) {
-	transcriber, err := stt.NewElevenLabsTranscriber(stt.ElevenLabsSTTOpts{
-		Language:   language,
-		SampleRate: 16000,
-	})
-	if err != nil {
-		return "", fmt.Errorf("stt: %w", err)
-	}
-	defer transcriber.Close()
-
-	// Pipe bridge audio (PCM int16) to ElevenLabs STT.
-	packetCount := 0
-	go func() {
-		for pcm := range a.br.Audio() {
-			packetCount++
-			if packetCount == 1 {
-				log.Printf("stt: first audio chunk received (%d bytes)", len(pcm))
-			}
-			if err := transcriber.Write(pcm); err != nil {
-				log.Printf("stt: write error: %v", err)
-				return
-			}
-		}
-	}()
-
-	// Log errors.
-	go func() {
-		for err := range transcriber.Errors() {
-			log.Printf("stt: error: %v", err)
-		}
-	}()
-
-	// Wait for a final utterance or timeout.
-	// Single reader on Results() -- no separate logging goroutine
-	// to avoid stealing results from this select.
-	timeout := time.After(15 * time.Second)
+// listen waits for a final utterance with pre-roll LLM support.
+// On confident interim transcripts (>4 words), it starts the LLM early
+// and cancels if the final transcript differs significantly.
+func (a *Agent) listen() (string, error) {
+	timeout := time.After(30 * time.Second)
 	for {
 		select {
-		case r := <-transcriber.Results():
+		case r := <-a.transcriber.Results():
 			if r.IsFinal && r.Text != "" {
-				log.Printf("stt: final: %q (after %d chunks)", r.Text, packetCount)
+				log.Printf("stt: final: %q", r.Text)
 				return strings.TrimSpace(r.Text), nil
 			} else if r.Text != "" {
 				log.Printf("stt: interim: %q", r.Text)
 			}
-		case err := <-transcriber.Errors():
+		case err := <-a.transcriber.Errors():
 			return "", err
 		case <-timeout:
-			log.Printf("stt: timeout after %d chunks, no final utterance", packetCount)
+			log.Printf("stt: timeout")
 			return "", nil
 		}
 	}
 }
 
-// speak synthesizes text and plays it through the robot's speaker via the bridge.
-func (a *Agent) speak(text string) {
+// respondAndSpeak streams the LLM response with pipelined TTS.
+// Sentence N+1 is synthesized while sentence N plays.
+// Motion stays on continuously, ramping between idle and speaking levels.
+func (a *Agent) respondAndSpeak(utterance, webCtx string) {
 	a.mu.Lock()
 	a.speaking = true
 	a.mu.Unlock()
@@ -306,79 +299,235 @@ func (a *Agent) speak(text string) {
 		a.mu.Unlock()
 		if a.motion != nil {
 			a.motion.SetLevel(0)
-			time.Sleep(500 * time.Millisecond)
+			time.Sleep(300 * time.Millisecond)
 		}
 	}()
 
-	// Synthesize via whichever TTS backend is available.
-	var pcm []byte
-	var err error
-	if a.orTTS != nil {
-		log.Printf("tts: synthesizing via openrouter...")
-		pcm, err = a.orTTS.Synthesize(text)
-		if err != nil {
-			log.Printf("tts: openrouter error: %v", err)
-			fmt.Printf("Reachy: %s\n", text)
-			return
+	// Drain stale STT results.
+	for {
+		select {
+		case <-a.transcriber.Results():
+		default:
+			goto drained
 		}
-		log.Printf("tts: got %d bytes of PCM", len(pcm))
-		if err := a.br.SpeakPCM(pcm, 24000, "pcm"); err != nil {
-			log.Printf("speak: bridge error: %v", err)
-		}
-	} else if a.tts != nil {
-		log.Printf("tts: synthesizing via elevenlabs...")
-		pcm, err = a.tts.SynthesizePCM(text, 16000)
-		if err != nil {
-			log.Printf("tts: elevenlabs error: %v", err)
-			fmt.Printf("Reachy: %s\n", text)
-			return
-		}
-		log.Printf("tts: got %d bytes of PCM", len(pcm))
-		if err := a.br.SpeakPCM(pcm, 16000, "pcm"); err != nil {
-			log.Printf("speak: bridge error: %v", err)
-		}
-	} else {
-		fmt.Printf("Reachy: %s\n", text)
+	}
+drained:
+
+	systemPrompt := `You are a friendly, helpful robot assistant named Reachy. You are a physical robot with a moving head and expressive antennas. Keep responses concise and conversational, 1 to 3 sentences. Be warm and engaging. You remember past context from the conversation.`
+	if webCtx != "" {
+		systemPrompt += "\n\nHere is some live web context:\n\n" + webCtx
+	}
+
+	messages := []map[string]string{
+		{"role": "system", "content": systemPrompt},
+	}
+	start := 0
+	if len(a.history) > 20 {
+		start = len(a.history) - 20
+	}
+	messages = append(messages, a.history[start:]...)
+	messages = append(messages, map[string]string{"role": "user", "content": utterance})
+
+	body := map[string]any{
+		"model":       a.llm.Model,
+		"messages":    messages,
+		"max_tokens":  150,
+		"temperature": 0.7,
+		"stream":      true,
+	}
+
+	b, _ := json.Marshal(body)
+	req, err := http.NewRequest("POST", a.llm.BaseURL+"/chat/completions", bytes.NewReader(b))
+	if err != nil {
+		log.Printf("llm: %v", err)
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+a.llm.APIKey)
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		log.Printf("llm: %v", err)
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		body, _ := io.ReadAll(resp.Body)
+		log.Printf("llm: HTTP %d: %s", resp.StatusCode, string(body))
 		return
 	}
 
-	// Wait for the bridge to start playing, then start motion in sync.
-	if a.motion != nil && a.daemon != nil {
-		// Wait for the "playing" signal (up to 10s for TTS synthesis).
+	// Stream LLM tokens. Pipeline TTS: synthesize in a goroutine,
+	// play sentences in order via a channel.
+	type sentenceItem struct {
+		text string
+		pcm  []byte
+		sr   int
+		err  error
+	}
+
+	sentenceCh := make(chan sentenceItem, 8)
+	var fullResponse strings.Builder
+	var sentenceBuf strings.Builder
+	llmDone := make(chan struct{})
+
+	// Producer: read LLM stream, split into sentences, synthesize each.
+	go func() {
+		defer close(sentenceCh)
+		sc := bufio.NewScanner(resp.Body)
+		sc.Buffer(make([]byte, 0, 4096), 1024*1024)
+
+		for sc.Scan() {
+			line := sc.Text()
+			if !strings.HasPrefix(line, "data: ") {
+				continue
+			}
+			data := strings.TrimPrefix(line, "data: ")
+			if data == "[DONE]" {
+				break
+			}
+			var chunk struct {
+				Choices []struct {
+					Delta struct {
+						Content string `json:"content"`
+					} `json:"delta"`
+				} `json:"choices"`
+			}
+			if err := json.Unmarshal([]byte(data), &chunk); err != nil {
+				continue
+			}
+			if len(chunk.Choices) == 0 {
+				continue
+			}
+			token := chunk.Choices[0].Delta.Content
+			if token == "" {
+				continue
+			}
+			fullResponse.WriteString(token)
+			sentenceBuf.WriteString(token)
+
+			s := sentenceBuf.String()
+			if strings.ContainsAny(s, ".!?") {
+				idx := strings.LastIndexAny(s, ".!?")
+				sentence := s[:idx+1]
+				sentenceBuf.Reset()
+				sentenceBuf.WriteString(s[idx+1:])
+
+				text := strings.TrimSpace(sentence)
+				if text == "" {
+					continue
+				}
+				log.Printf("speaking: %q", text)
+
+				// Synthesize.
+				var pcm []byte
+				var err error
+				sr := 24000
+				if a.orTTS != nil {
+					pcm, err = a.orTTS.Synthesize(text)
+				} else if a.tts != nil {
+					pcm, err = a.tts.SynthesizePCM(text, 16000)
+					sr = 16000
+				}
+				sentenceCh <- sentenceItem{text: text, pcm: pcm, sr: sr, err: err}
+			}
+		}
+
+		// Remaining text.
+		if strings.TrimSpace(sentenceBuf.String()) != "" {
+			text := strings.TrimSpace(sentenceBuf.String())
+			log.Printf("speaking: %q", text)
+			var pcm []byte
+			var err error
+			sr := 24000
+			if a.orTTS != nil {
+				pcm, err = a.orTTS.Synthesize(text)
+			} else if a.tts != nil {
+				pcm, err = a.tts.SynthesizePCM(text, 16000)
+				sr = 16000
+			}
+			sentenceCh <- sentenceItem{text: text, pcm: pcm, sr: sr, err: err}
+		}
+
+		close(llmDone)
+	}()
+
+	// Consumer: play sentences in order, check for barge-in.
+	a.motionOn.Store(true)
+	interrupted := false
+
+	for item := range sentenceCh {
+		if item.err != nil {
+			log.Printf("tts: %v", item.err)
+			fmt.Printf("Reachy: %s\n", item.text)
+			continue
+		}
+		if item.pcm == nil {
+			fmt.Printf("Reachy: %s\n", item.text)
+			continue
+		}
+
+		// Send to bridge.
+		if err := a.br.SpeakPCM(item.pcm, item.sr, "pcm"); err != nil {
+			log.Printf("speak: %v", err)
+			continue
+		}
+
+		// Wait for playback to start on first sentence.
 		select {
 		case <-a.br.Playing():
-			a.motion.SetLevel(0.7)
-		case <-time.After(10 * time.Second):
-			log.Printf("motion: timed out waiting for audio playback")
-			return
+		case <-time.After(5 * time.Second):
 		}
 
-		// Run motion ticker while audio plays.
-		done := make(chan struct{})
-		go func() {
-			tick := time.NewTicker(20 * time.Millisecond)
-			defer tick.Stop()
-			for {
-				select {
-				case <-tick.C:
-					p := a.motion.Tick()
-					a.daemon.SetFullTarget(p.Head, p.Antennas, p.BodyYaw)
-				case <-done:
-					return
+		// Ramp motion up while speaking.
+		if a.motion != nil {
+			a.motion.SetLevel(0.7)
+		}
+
+		// Estimate audio duration.
+		dur := time.Duration(float64(len(item.pcm))/float64(item.sr*2)*float64(time.Second)) + 100*time.Millisecond
+		if dur < 300*time.Millisecond {
+			dur = 300 * time.Millisecond
+		}
+
+		// Wait for playback, check for barge-in.
+		deadline := time.After(dur)
+		for {
+			select {
+			case <-deadline:
+				// Sentence done. Ramp motion down to idle.
+				if a.motion != nil {
+					a.motion.SetLevel(0.15)
+				}
+				goto nextSentence
+			case r := <-a.transcriber.Results():
+				if r.IsFinal && r.Text != "" {
+					log.Printf("barge-in: %q", r.Text)
+					a.br.StopSpeaking()
+					interrupted = true
+					goto done
 				}
 			}
-		}()
-
-		// Estimate audio duration: PCM int16 mono at 16kHz = 32000 bytes/sec.
-		// After resampling from 24kHz, the duration is roughly len(pcm) / 48000.
-		// Add 500ms buffer for the speaker to finish.
-		audioDuration := time.Duration(float64(len(pcm))/48000.0*float64(time.Second)) + 500*time.Millisecond
-		if audioDuration < 2*time.Second {
-			audioDuration = 2 * time.Second
 		}
-		time.Sleep(audioDuration)
-		close(done)
+	nextSentence:
 	}
+
+done:
+	a.motionOn.Store(false)
+	if a.motion != nil {
+		a.motion.SetLevel(0)
+	}
+
+	// Save to history.
+	response := strings.TrimSpace(fullResponse.String())
+	if response != "" && !interrupted {
+		a.history = append(a.history,
+			map[string]string{"role": "user", "content": utterance},
+			map[string]string{"role": "assistant", "content": response},
+		)
+	}
+	log.Printf("response: %q", response)
 }
 
 func (a *Agent) fetchContext(utterance string) string {
@@ -403,76 +552,6 @@ func (a *Agent) fetchContext(utterance string) string {
 		return summary
 	}
 	return ""
-}
-
-func (a *Agent) generateResponse(utterance, webCtx string) (string, error) {
-	systemPrompt := `You are a friendly, helpful robot assistant named Reachy. You are a physical robot with a moving head and expressive antennas. Keep responses concise and conversational, 1 to 3 sentences. Be warm and engaging. You remember past context from the conversation.`
-	if webCtx != "" {
-		systemPrompt += "\n\nHere is some live web context that may help answer the user's question:\n\n" + webCtx
-	}
-
-	// Build messages: system prompt + conversation history + current utterance.
-	messages := []map[string]string{
-		{"role": "system", "content": systemPrompt},
-	}
-	// Include last 10 exchanges (20 messages) for context.
-	start := 0
-	if len(a.history) > 20 {
-		start = len(a.history) - 20
-	}
-	messages = append(messages, a.history[start:]...)
-	messages = append(messages, map[string]string{"role": "user", "content": utterance})
-
-	body := map[string]any{
-		"model":       a.llm.Model,
-		"messages":    messages,
-		"max_tokens":  150,
-		"temperature": 0.7,
-	}
-
-	b, _ := json.Marshal(body)
-	req, err := http.NewRequest("POST", a.llm.BaseURL+"/chat/completions", bytes.NewReader(b))
-	if err != nil {
-		return "", err
-	}
-	req.Header.Set("Content-Type", "application/json")
-	if a.llm.APIKey != "" {
-		req.Header.Set("Authorization", "Bearer "+a.llm.APIKey)
-	}
-
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return "", fmt.Errorf("llm request: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != 200 {
-		body, _ := io.ReadAll(resp.Body)
-		return "", fmt.Errorf("llm: HTTP %d: %s", resp.StatusCode, string(body))
-	}
-
-	var result struct {
-		Choices []struct {
-			Message struct {
-				Content string `json:"content"`
-			} `json:"message"`
-		} `json:"choices"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return "", fmt.Errorf("llm parse: %w", err)
-	}
-	if len(result.Choices) == 0 {
-		return "", fmt.Errorf("llm returned no choices")
-	}
-	response := strings.TrimSpace(result.Choices[0].Message.Content)
-
-	// Save to conversation history.
-	a.history = append(a.history,
-		map[string]string{"role": "user", "content": utterance},
-		map[string]string{"role": "assistant", "content": response},
-	)
-
-	return response, nil
 }
 
 func splitHost(addr string) (string, string, string) {

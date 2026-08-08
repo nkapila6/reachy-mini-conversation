@@ -34,10 +34,11 @@ type ElevenLabsTranscriber struct {
 
 // ElevenLabsSTTOpts configures the ElevenLabs STT transcriber.
 type ElevenLabsSTTOpts struct {
-	APIKey     string // If empty, reads ELEVENLABS_API_KEY from env.
-	Language   string // ISO 639-1 language code (default "en").
-	Model      string // STT model (default "scribe_v2_realtime").
-	SampleRate int    // Audio sample rate in Hz (default 16000).
+	APIKey            string  // If empty, reads ELEVENLABS_API_KEY from env.
+	Language          string  // ISO 639-1 language code (default "en").
+	Model             string  // STT model (default "scribe_v2_realtime").
+	SampleRate        int     // Audio sample rate in Hz (default 16000).
+	VadSilenceSeconds float64 // VAD silence threshold in seconds (default 0.8).
 }
 
 // NewElevenLabsTranscriber creates a new ElevenLabs streaming STT transcriber.
@@ -64,6 +65,10 @@ func NewElevenLabsTranscriber(opts ElevenLabsSTTOpts) (*ElevenLabsTranscriber, e
 	if sampleRate == 0 {
 		sampleRate = 16000
 	}
+	vadSilence := opts.VadSilenceSeconds
+	if vadSilence == 0 {
+		vadSilence = 0.8
+	}
 
 	// Config via query params per the API reference.
 	u := url.URL{
@@ -71,8 +76,8 @@ func NewElevenLabsTranscriber(opts ElevenLabsSTTOpts) (*ElevenLabsTranscriber, e
 		Host:   "api.elevenlabs.io",
 		Path:   "/v1/speech-to-text/realtime",
 		RawQuery: fmt.Sprintf(
-			"model_id=%s&audio_format=pcm_%d&language_code=%s&commit_strategy=vad",
-			model, sampleRate, lang,
+			"model_id=%s&audio_format=pcm_%d&language_code=%s&commit_strategy=vad&vad_silence_threshold_secs=%g",
+			model, sampleRate, lang, vadSilence,
 		),
 	}
 

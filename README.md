@@ -44,12 +44,11 @@ Talk to the robot. Press Ctrl-C to stop (the robot goes to sleep).
 | Flag | Default | Description |
 |---|---|---|
 | `-tts` | `openrouter` | TTS backend: `openrouter` or `elevenlabs` |
-| `-voice` | `am_onyx` | Kokoro voice (af_heart, am_onyx, bf_emma, hf_alpha, etc) |
-| `-model` | `openai/gpt-4o-mini` | LLM model on OpenRouter |
+| `-tts-model` | `microsoft/mai-voice-2-flash` | TTS model on OpenRouter |
+| `-voice` | `en-US-Harper:MAI-Voice-2` | Voice (model-specific) |
+| `-model` | `ibm-granite/granite-4.1-8b` | LLM model on OpenRouter |
 | `-language` | `en` | STT language |
 | `-no-motors` | `false` | Skip motor connection |
-
-Full voice list: [huggingface.co/hexgrad/Kokoro-82M/blob/main/VOICES.md](https://huggingface.co/hexgrad/Kokoro-82M/blob/main/VOICES.md)
 
 ## How it works
 

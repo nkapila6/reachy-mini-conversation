@@ -1,7 +1,7 @@
 // Package tts provides text-to-speech via OpenRouter's audio speech API.
 //
-// Uses the same OPENROUTER_API_KEY as the LLM. Supports the Kokoro-82M model
-// and any other TTS model on OpenRouter.
+// Uses the same OPENROUTER_API_KEY as the LLM. Supports Kokoro-82M and
+// Fish Audio S1, plus any other TTS model on OpenRouter.
 //
 // API reference: https://openrouter.ai/docs/agent-sdk/typescript/api-reference/tts
 // Endpoint: POST https://openrouter.ai/api/v1/audio/speech
@@ -28,8 +28,8 @@ type OpenRouterSynthesizer struct {
 // OpenRouterTTSOpts configures the OpenRouter TTS synthesizer.
 type OpenRouterTTSOpts struct {
 	APIKey string // If empty, reads OPENROUTER_API_KEY from env.
-	Model  string // TTS model (default "hexgrad/kokoro-82m").
-	Voice  string // Voice name (default "am_onyx").
+	Model  string // TTS model (default "fish-audio/s1").
+	Voice  string // Voice name (model-specific).
 }
 
 // NewOpenRouterSynthesizer creates a new OpenRouter TTS synthesizer.
@@ -44,12 +44,9 @@ func NewOpenRouterSynthesizer(opts OpenRouterTTSOpts) (*OpenRouterSynthesizer, e
 
 	model := opts.Model
 	if model == "" {
-		model = "hexgrad/kokoro-82m"
+		model = "fish-audio/s1"
 	}
 	voice := opts.Voice
-	if voice == "" {
-		voice = "am_onyx"
-	}
 
 	return &OpenRouterSynthesizer{
 		apiKey: apiKey,
@@ -60,21 +57,25 @@ func NewOpenRouterSynthesizer(opts OpenRouterTTSOpts) (*OpenRouterSynthesizer, e
 }
 
 // orTTSRequest matches the OpenRouter TTS API spec.
-// response_format "pcm" returns raw PCM int16 at 24kHz.
+// Fish Audio S1 doesn't use voice or response_format -- just input + model.
+// Kokoro uses voice + response_format.
 type orTTSRequest struct {
 	Input          string `json:"input"`
 	Model          string `json:"model"`
-	Voice          string `json:"voice"`
+	Voice          string `json:"voice,omitempty"`
 	ResponseFormat string `json:"response_format,omitempty"`
 }
 
-// Synthesize converts text to PCM int16 audio bytes at 24kHz.
+// Synthesize converts text to audio bytes (MP3 by default).
 func (s *OpenRouterSynthesizer) Synthesize(text string) ([]byte, error) {
 	body := orTTSRequest{
-		Input:          text,
-		Model:          s.model,
-		Voice:          s.voice,
-		ResponseFormat: "pcm",
+		Input: text,
+		Model: s.model,
+	}
+	// Kokoro needs voice + response_format. Fish Audio S1 doesn't.
+	if s.voice != "" {
+		body.Voice = s.voice
+		body.ResponseFormat = "pcm"
 	}
 
 	b, err := json.Marshal(body)
